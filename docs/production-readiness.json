@@ -1,0 +1,38 @@
+{
+  "product": "ChainShield AI",
+  "auditStatus": "implementation-audited-with-prerequisites",
+  "auditedAt": "2026-09-18",
+  "implemented": {
+    "authentication": { "status": "implemented", "evidence": ["OAuth session flow", "protected tRPC procedures", "secure session cookie plumbing"] },
+    "authorization": { "status": "implemented-with-scope", "evidence": ["workspace owner/member isolation", "owner/maintainer scan mutation gate", "viewer/reviewer read access"] },
+    "inputValidation": { "status": "implemented", "evidence": ["zod API schemas", "10 MiB bundle limit", "750 KiB per-file limit", "safe relative paths"] },
+    "uploadSecurity": { "status": "implemented-with-scope", "evidence": ["secret-marker rejection", "object storage references instead of DB blobs", "bounded request body"], "limitation": "Full archive extraction bomb scanning is not enabled because the current API accepts normalized file arrays; ZIP/TAR ingestion must add streaming extraction limits before production." },
+    "sandboxing": { "status": "boundary-implemented-worker-required", "evidence": ["external worker adapter", "worker endpoint/token", "unsupported result when absent", "standalone solc/Slither worker entry contract"], "limitation": "A separately deployed hardened worker is still required for live tool execution." },
+    "secrets": { "status": "implemented", "evidence": ["server-only Forge key use", "no private-key persistence", "redacted errors", "no secret template committed"] },
+    "rateLimiting": { "status": "implemented-fallback", "evidence": ["bounded tRPC rate limiter"], "limitation": "Replace the process-local limiter with Redis or an API-gateway limiter for multi-instance production." },
+    "apiSecurity": { "status": "implemented", "evidence": ["typed tRPC API", "structured TRPC errors", "request IDs", "security headers", "same-origin API"] },
+    "databaseIsolation": { "status": "implemented", "evidence": ["workspace owner/member predicates", "project-scoped records", "immutable source hashes", "audit event chain"] },
+    "logging": { "status": "implemented-with-scope", "evidence": ["structured request/error logs", "request ID propagation", "secret-safe error output"], "limitation": "Central log sink and alert policy are deployment responsibilities." },
+    "testing": { "status": "implemented", "evidence": ["auth regression test", "upload security tests", "custom detector/evidence tests", "worker boundary tests", "CI check/test/build"] },
+    "docker": { "status": "implemented", "evidence": ["non-root multi-stage Dockerfile", "Compose MySQL development stack", "Docker ignore rules"] },
+    "ciCd": { "status": "implemented", "evidence": ["GitHub Actions workflow for install/check/test/build/Docker validation"] },
+    "privacy": { "status": "documented-with-prerequisites", "evidence": ["privacy policy", "source-code minimization", "no training claim", "hash-only report anchoring"], "limitation": "Retention/deletion jobs, regional processing, and legal policy publication remain deployment/product work." }
+  },
+  "notYetProductionComplete": [
+    "Deploy and independently harden the compiler/Slither/behavioral worker.",
+    "Replace the process-local rate limiter with shared infrastructure.",
+    "Add streaming ZIP/TAR extraction with archive bomb limits before accepting archives.",
+    "Add retention/deletion jobs and object-store deletion controls.",
+    "Add centralized metrics, tracing, alerting, and external error monitoring.",
+    "Complete external penetration testing, dependency scanning, threat modeling, and restore testing.",
+    "Add real asynchronous queue/heartbeat processing for scans longer than one request window.",
+    "Add reviewer mutation procedures and end-to-end UI tests for the full finding lifecycle."
+  ],
+  "responsibleSecurity": [
+    "This analysis does not guarantee that a contract is secure.",
+    "AI findings require evidence and human review.",
+    "Suggested patches must be tested and re-scanned before resolution.",
+    "External dependencies and deployment configuration can introduce risks outside source analysis.",
+    "Professional security review is recommended for contracts handling real funds."
+  ]
+}
