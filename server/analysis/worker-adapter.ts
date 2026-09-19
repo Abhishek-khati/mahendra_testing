@@ -1,7 +1,7 @@
 import type { WorkerStageRequest, WorkerStageResult } from "./contracts";
 
 export interface AnalysisWorkerAdapter {
-  execute(request: WorkerStageRequest): Promise<WorkerStageResult>;
+  execute(request: WorkerStageRequest, files: Array<{ path: string; content: string }>): Promise<WorkerStageResult>;
 }
 
 const unsupportedResult = (request: WorkerStageRequest, errorCode: string, limitation: string): WorkerStageResult => ({
@@ -31,7 +31,7 @@ export class ExternalSandboxWorkerAdapter implements AnalysisWorkerAdapter {
   private readonly endpoint = process.env.CHAINSHIELD_WORKER_URL?.trim();
   private readonly token = process.env.CHAINSHIELD_WORKER_TOKEN?.trim();
 
-  async execute(request: WorkerStageRequest): Promise<WorkerStageResult> {
+  async execute(request: WorkerStageRequest, files: Array<{ path: string; content: string }> = []): Promise<WorkerStageResult> {
     if (!this.endpoint || !this.token) {
       return unsupportedResult(
         request,
@@ -47,7 +47,8 @@ export class ExternalSandboxWorkerAdapter implements AnalysisWorkerAdapter {
         authorization: `Bearer ${this.token}`,
         "x-chainshield-request-id": request.requestId,
       },
-      body: JSON.stringify(request),
+      // Include source files inline so the worker can write them to a temp dir
+      body: JSON.stringify({ ...request, files }),
       signal: AbortSignal.timeout(request.policy.timeoutMs),
     });
 

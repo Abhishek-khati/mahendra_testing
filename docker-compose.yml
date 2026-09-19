@@ -16,20 +16,57 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Isolated analysis worker (Slither + solc) ─────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      WORKER_SECRET_TOKEN: ${WORKER_SECRET_TOKEN:?set WORKER_SECRET_TOKEN in .env}
+    ports:
+      - "4000:4000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    # Restrict network access — worker should not call the internet
+    # Uncomment below in production for hardened isolation:
+    # network_mode: none
+
   app:
     build: .
     depends_on:
       db:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     environment:
       NODE_ENV: production
       PORT: 3000
       DATABASE_URL: mysql://chainshield:${MYSQL_PASSWORD}@db:3306/chainshield
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
-      # Configure CHAINSHIELD_WORKER_URL and CHAINSHIELD_WORKER_TOKEN only when a separate sandbox is deployed.
-      CHAINSHIELD_WORKER_URL: ${CHAINSHIELD_WORKER_URL:-}
-      CHAINSHIELD_WORKER_TOKEN: ${CHAINSHIELD_WORKER_TOKEN:-}
+      # Worker is now wired via Docker internal network
+      CHAINSHIELD_WORKER_URL: ${CHAINSHIELD_WORKER_URL:-http://worker:4000}
+      CHAINSHIELD_WORKER_TOKEN: ${WORKER_SECRET_TOKEN:?set WORKER_SECRET_TOKEN in .env}
+      REDIS_URL: redis://redis:6379
     ports:
       - "3000:3000"
+
 volumes:
   chainshield-db:

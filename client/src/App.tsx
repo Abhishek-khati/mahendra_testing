@@ -821,7 +821,11 @@ function ScanSetup() {
   const [running, setRunning] = useState(false);
   const [done, setDone] = useState(false);
   const [uploadedFiles, setUploadedFiles] = useState<Array<{ path: string; content: string }>>([]);
+  const [archiveBase64, setArchiveBase64] = useState<string | null>(null);
   const [pastedFilename, setPastedFilename] = useState("src/Contract.sol");
+  const [githubUrl, setGithubUrl] = useState("https://github.com/OpenZeppelin/openzeppelin-contracts");
+  const [githubBranch, setGithubBranch] = useState("master");
+  const [githubSubpath, setGithubSubpath] = useState("contracts");
   const [pastedCode, setPastedCode] = useState(`// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
@@ -840,8 +844,54 @@ contract MyVault {
     }
 }`);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [, setLocation] = useLocation();
+  const [activeRunId, setActiveRunId] = useState<number | null>(null);
+  const [pollElapsed, setPollElapsed] = useState(0);
+
   const workspace = trpc.analysis.workspace.useQuery();
   const startScan = trpc.analysis.startScan.useMutation();
+  const fetchGitHub = trpc.analysis.fetchGitHubRepo.useMutation();
+
+  const runQuery = trpc.analysis.run.useQuery(
+    { runId: activeRunId! },
+    {
+      enabled: !!activeRunId,
+      refetchInterval: (query) => {
+        const status = query.state.data?.run?.status;
+        if (status === "completed" || status === "partial" || status === "failed") {
+          return false;
+        }
+        return 1500;
+      },
+    }
+  );
+
+  useEffect(() => {
+    let interval: any;
+    if (running) {
+      interval = setInterval(() => {
+        setPollElapsed((prev) => prev + 1);
+      }, 1000);
+    } else {
+      setPollElapsed(0);
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [running]);
+
+  useEffect(() => {
+    if (!runQuery.data?.run) return;
+    const status = runQuery.data.run.status;
+    if (status === "completed" || status === "partial") {
+      setRunning(false);
+      setDone(true);
+      toast.success(`Analysis finished! Found ${runQuery.data.findings?.length || 0} security observations.`);
+    } else if (status === "failed") {
+      setRunning(false);
+      toast.error(`Scan execution failed: ${runQuery.data.run.errorCode || "Stage error"}`);
+    }
+  }, [runQuery.data?.run?.status]);
 
   const toggle = (key: keyof typeof stages) => setStages((prev) => ({ ...prev, [key]: !prev[key] }));
 
@@ -849,11 +899,37 @@ contract MyVault {
     const files = Array.from(event.target.files ?? []);
     if (files.length === 0) return;
     const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
-    if (files.length > 100 || totalBytes > 10 * 1024 * 1024 || files.some((file) => file.size > 750_000)) {
-      toast.error("Upload limit: max 100 files, 10 MiB total, 750 KiB per file.");
+
+    if (totalBytes > 10 * 1024 * 1024) {
+      toast.error("Upload limit: max 10 MiB total.");
       event.target.value = "";
       return;
     }
+
+    if (files.length === 1 && files[0].name.endsWith(".zip")) {
+      const file = files[0];
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const result = e.target?.result as string;
+        const b64 = result.split(",")[1];
+        setArchiveBase64(b64);
+        setUploadedFiles([]);
+        setDone(false);
+        toast.success(`Archive ${file.name} loaded successfully.`);
+      };
+      reader.onerror = () => toast.error("Failed to read ZIP file");
+      reader.readAsDataURL(file);
+      event.target.value = "";
+      return;
+    }
+
+    if (files.length > 100 || files.some((file) => file.size > 750_000)) {
+      toast.error("Upload limit: max 100 files, 750 KiB per file.");
+      event.target.value = "";
+      return;
+    }
+
+    setArchiveBase64(null);
     const loaded = await Promise.all(files.map(async (file) => ({ path: file.name, content: await file.text() })));
     setUploadedFiles(loaded);
     setDone(false);
@@ -862,9 +938,10 @@ contract MyVault {
 
   const run = () => {
     setRunning(true);
+    setDone(false);
     const fixtureContent = codeLines.map(([, code]) => code).join("\n");
     const requestedStages = [
-      ...(stages.deterministic ? ["solidity-compile"] : []),
+      ...(stages.deterministic ? ["solidity-compile", "slither"] : []),
       ...(stages.custom ? ["custom-deterministic"] : []),
       ...(stages.testing ? ["behavioral-tests"] : []),
     ];
@@ -872,6 +949,8 @@ contract MyVault {
     const targetFiles =
       source === "paste"
         ? [{ path: pastedFilename.trim() || "src/Contract.sol", content: pastedCode }]
+        : source === "repo"
+        ? []
         : uploadedFiles.length > 0
         ? uploadedFiles
         : [{ path: "src/Vault.sol", content: fixtureContent }];
@@ -879,17 +958,22 @@ contract MyVault {
     startScan.mutate(
       {
         projectId: workspace.data?.project?.id,
-        sourceKind: source === "paste" ? "upload" : uploadedFiles.length > 0 ? "upload" : "fixture",
-        revisionLabel: source === "paste" ? `paste-${Date.now()}` : uploadedFiles.length > 0 ? `upload-${Date.now()}` : "fixture-v0.1",
+        sourceKind: source === "paste" ? "upload" : source === "repo" ? "repository" : (uploadedFiles.length > 0 || archiveBase64) ? "upload" : "fixture",
+        revisionLabel: source === "paste" ? `paste-${Date.now()}` : source === "repo" ? `github-${Date.now()}` : (uploadedFiles.length > 0 || archiveBase64) ? `upload-${Date.now()}` : "fixture-v0.1",
         idempotencyKey: `${source}-${Date.now()}`,
         files: targetFiles,
+        archiveBase64: source === "upload" && archiveBase64 ? archiveBase64 : undefined,
+        githubUrl: source === "repo" ? githubUrl.trim() : undefined,
+        githubBranch: source === "repo" && githubBranch.trim() ? githubBranch.trim() : undefined,
+        githubSubpath: source === "repo" && githubSubpath.trim() ? githubSubpath.trim() : undefined,
         requestedStages,
       },
       {
         onSuccess: (result) => {
-          setRunning(false);
-          setDone(true);
-          toast.success(`Analysis run queued! Status: ${result.status}`);
+          setActiveRunId(result.runId ?? null);
+          setRunning(true);
+          setDone(false);
+          toast.success(`Analysis run queued (#${result.runId})! Executing security stages...`);
         },
         onError: (error) => {
           setRunning(false);
@@ -983,15 +1067,121 @@ contract MyVault {
                 </div>
               </div>
             ) : (
-              <div className="mt-5 space-y-3">
-                <div className="flex items-center gap-3 rounded-xl border border-border bg-muted/30 p-3">
-                  <Github size={18} className="text-foreground" />
-                  <div className="flex-1 text-[12px] text-foreground font-medium">github.com/aster-protocol/vaults</div>
-                  <Pill tone="amber">Read-only</Pill>
+              <div className="mt-5 space-y-4">
+                <div>
+                  <label className="block mb-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+                    GitHub Repository URL
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <div className="relative flex-1">
+                      <Github size={16} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
+                      <input
+                        value={githubUrl}
+                        onChange={(e) => setGithubUrl(e.target.value)}
+                        placeholder="https://github.com/owner/repository"
+                        className="w-full rounded-xl border border-border bg-input pl-10 pr-3 py-2 text-[12px] font-mono text-foreground outline-none focus:border-primary"
+                      />
+                    </div>
+                    <Button
+                      variant="outline"
+                      disabled={fetchGitHub.isPending || !githubUrl.trim()}
+                      onClick={() => {
+                        fetchGitHub.mutate(
+                          { url: githubUrl.trim(), branch: githubBranch.trim() || undefined, subpath: githubSubpath.trim() || undefined },
+                          {
+                            onSuccess: (data) => {
+                              toast.success(`Discovered ${data.files.length} contracts on branch '${data.branch}'!`);
+                            },
+                            onError: (err) => {
+                              toast.error(`GitHub fetch failed: ${err.message}`);
+                            },
+                          }
+                        );
+                      }}
+                      className="text-xs h-9 px-3"
+                    >
+                      <RefreshCcw size={13} className={`mr-1.5 ${fetchGitHub.isPending ? "animate-spin" : ""}`} />
+                      Verify & Preview
+                    </Button>
+                  </div>
                 </div>
+
                 <div className="grid grid-cols-2 gap-3">
-                  <InputField label="Branch / Revision" value="main" />
-                  <InputField label="Subdirectory" value="contracts/" />
+                  <div>
+                    <label className="block mb-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+                      Branch / Tag
+                    </label>
+                    <input
+                      value={githubBranch}
+                      onChange={(e) => setGithubBranch(e.target.value)}
+                      placeholder="e.g. main or master"
+                      className="w-full rounded-xl border border-border bg-input px-3 py-2 text-[12px] font-mono text-foreground outline-none focus:border-primary"
+                    />
+                  </div>
+                  <div>
+                    <label className="block mb-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+                      Subdirectory / Path
+                    </label>
+                    <input
+                      value={githubSubpath}
+                      onChange={(e) => setGithubSubpath(e.target.value)}
+                      placeholder="e.g. contracts or src"
+                      className="w-full rounded-xl border border-border bg-input px-3 py-2 text-[12px] font-mono text-foreground outline-none focus:border-primary"
+                    />
+                  </div>
+                </div>
+
+                {fetchGitHub.data && (
+                  <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-3.5 text-[11px] text-foreground space-y-1.5">
+                    <div className="flex items-center justify-between font-semibold text-emerald-500">
+                      <span className="flex items-center gap-1.5">
+                        <CheckCircle2 size={14} /> {fetchGitHub.data.files.length} contracts ready to scan
+                      </span>
+                      <span className="font-mono text-[10px] text-muted-foreground">@{fetchGitHub.data.branch}</span>
+                    </div>
+                    <div className="max-h-24 overflow-y-auto space-y-1 text-muted-foreground font-mono text-[10px] pl-1">
+                      {fetchGitHub.data.files.slice(0, 8).map((f) => (
+                        <div key={f.path} className="truncate">• {f.path}</div>
+                      ))}
+                      {fetchGitHub.data.files.length > 8 && (
+                        <div className="text-primary italic">+ {fetchGitHub.data.files.length - 8} more files...</div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  <span className="text-[10px] uppercase font-bold tracking-wider text-muted-foreground">Popular:</span>
+                  <button
+                    onClick={() => {
+                      setGithubUrl("https://github.com/OpenZeppelin/openzeppelin-contracts");
+                      setGithubBranch("master");
+                      setGithubSubpath("contracts");
+                    }}
+                    className="px-2 py-0.5 rounded-md bg-muted text-[10px] font-medium text-foreground hover:bg-muted/80 transition"
+                  >
+                    OpenZeppelin
+                  </button>
+                  <button
+                    onClick={() => {
+                      setGithubUrl("https://github.com/Uniswap/v4-core");
+                      setGithubBranch("main");
+                      setGithubSubpath("src");
+                    }}
+                    className="px-2 py-0.5 rounded-md bg-muted text-[10px] font-medium text-foreground hover:bg-muted/80 transition"
+                  >
+                    Uniswap v4
+                  </button>
+                  <button
+                    onClick={() => {
+                      setGithubUrl("https://github.com/compound-finance/compound-protocol");
+                      setGithubBranch("master");
+                      setGithubSubpath("contracts");
+                    }}
+                    className="px-2 py-0.5 rounded-md bg-muted text-[10px] font-medium text-foreground hover:bg-muted/80 transition"
+                  >
+                    Compound Protocol
+                  </button>
                 </div>
               </div>
             )}
@@ -1024,14 +1214,24 @@ contract MyVault {
                 Executes analysis pipeline via tRPC router.
               </div>
             </div>
-            <Button onClick={run} disabled={running} className="min-w-[150px]">
+            <Button
+              onClick={() => {
+                if (done && activeRunId) {
+                  setLocation(`/workspace/findings?runId=${activeRunId}`);
+                } else {
+                  run();
+                }
+              }}
+              disabled={running}
+              className="min-w-[170px]"
+            >
               {running ? (
                 <>
-                  <RefreshCcw size={14} className="animate-spin" /> Scanning…
+                  <RefreshCcw size={14} className="animate-spin" /> Scanning… ({pollElapsed}s)
                 </>
-              ) : done ? (
+              ) : done && activeRunId ? (
                 <>
-                  <Check size={14} /> Scan Queued
+                  <Bug size={14} /> View Findings ({runQuery.data?.findings?.length ?? 0})
                 </>
               ) : (
                 <>
@@ -1043,6 +1243,147 @@ contract MyVault {
         </div>
 
         <div className="space-y-5">
+          {activeRunId && (
+            <Card className="overflow-hidden border-primary/40 bg-card shadow-lg">
+              <div className="border-b border-border bg-primary/10 px-5 py-4">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2 text-[13px] font-semibold text-foreground">
+                    {runQuery.data?.run?.status === "running" || runQuery.data?.run?.status === "queued" ? (
+                      <RefreshCcw size={15} className="animate-spin text-primary" />
+                    ) : runQuery.data?.run?.status === "failed" ? (
+                      <AlertCircle size={15} className="text-destructive" />
+                    ) : (
+                      <CheckCircle2 size={15} className="text-green-500" />
+                    )}
+                    Live Audit Pipeline #{activeRunId}
+                  </div>
+                  <Pill
+                    tone={
+                      runQuery.data?.run?.status === "completed"
+                        ? "green"
+                        : runQuery.data?.run?.status === "failed"
+                        ? "red"
+                        : runQuery.data?.run?.status === "running"
+                        ? "cyan"
+                        : "amber"
+                    }
+                  >
+                    {runQuery.data?.run?.status || "queued"}
+                  </Pill>
+                </div>
+                {running && (
+                  <div className="mt-2 flex items-center justify-between text-[11px] text-muted-foreground">
+                    <span className="flex items-center gap-1.5">
+                      <span className="size-2 rounded-full bg-primary animate-pulse" />
+                      Isolated workers compiling & analyzing...
+                    </span>
+                    <span className="font-mono">{pollElapsed}s elapsed</span>
+                  </div>
+                )}
+              </div>
+
+              <div className="p-5 space-y-4">
+                <div className="space-y-2">
+                  <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted-foreground">
+                    Execution Stages Progress
+                  </div>
+                  {runQuery.data?.stages && runQuery.data.stages.length > 0 ? (
+                    runQuery.data.stages.map((stage) => {
+                      const stageLabel =
+                        {
+                          "source-ingest": "01 / Source Ingest & Hash",
+                          "solidity-compile": "02 / Solc Compilation & AST",
+                          "slither": "03 / Slither Static Analysis",
+                          "custom-deterministic": "04 / Custom Security Rules",
+                          "behavioral-tests": "05 / Invariant & Fuzz Harness",
+                          "normalize-findings": "06 / Finding Normalization",
+                          "contextual-ai": "07 / Contextual AI Explanations",
+                          "report": "08 / Cryptographic Report",
+                        }[stage.stageType] || stage.stageType;
+
+                      return (
+                        <div
+                          key={stage.id}
+                          className={`flex items-center justify-between rounded-xl border p-2.5 transition ${
+                            stage.status === "running"
+                              ? "border-primary/50 bg-primary/10 shadow-sm"
+                              : stage.status === "succeeded"
+                              ? "border-green-500/20 bg-green-500/5"
+                              : stage.status === "failed"
+                              ? "border-destructive/30 bg-destructive/5"
+                              : "border-border/50 bg-muted/20 opacity-60"
+                          }`}
+                        >
+                          <div className="flex items-center gap-2.5">
+                            {stage.status === "running" ? (
+                              <RefreshCcw size={13} className="animate-spin text-primary shrink-0" />
+                            ) : stage.status === "succeeded" ? (
+                              <Check size={13} className="text-green-500 shrink-0 font-bold" />
+                            ) : stage.status === "failed" ? (
+                              <X size={13} className="text-destructive shrink-0" />
+                            ) : (
+                              <CircleDashed size={13} className="text-muted-foreground shrink-0" />
+                            )}
+                            <span className="text-[11px] font-medium text-foreground">{stageLabel}</span>
+                          </div>
+                          <span className="text-[10px] font-mono capitalize text-muted-foreground">
+                            {stage.status}
+                          </span>
+                        </div>
+                      );
+                    })
+                  ) : (
+                    <div className="flex items-center justify-center py-6 text-[12px] text-muted-foreground">
+                      <RefreshCcw size={14} className="animate-spin mr-2" /> Initializing worker execution...
+                    </div>
+                  )}
+                </div>
+
+                {(runQuery.data?.run?.status === "completed" || runQuery.data?.run?.status === "partial") && (
+                  <div className="mt-4 pt-4 border-t border-border space-y-3">
+                    <div className="rounded-xl border border-green-500/30 bg-green-500/10 p-3 text-center">
+                      <div className="text-[12px] font-semibold text-green-500 flex items-center justify-center gap-1.5">
+                        <CheckCircle2 size={16} /> Scan Completed!
+                      </div>
+                      <div className="mt-1 text-[11px] text-muted-foreground">
+                        Found <strong className="text-foreground">{runQuery.data.findings?.length ?? 0}</strong> security observations
+                      </div>
+                    </div>
+                    <Button
+                      onClick={() => setLocation(`/workspace/findings?runId=${activeRunId}`)}
+                      className="w-full gap-2 font-semibold"
+                    >
+                      <Bug size={14} /> View Security Findings ({runQuery.data.findings?.length ?? 0}) <ArrowRight size={14} />
+                    </Button>
+                    <Button
+                      variant="outline"
+                      onClick={() => setLocation("/workspace/report")}
+                      className="w-full gap-2 text-[12px]"
+                    >
+                      <FileJson2 size={14} /> Open Audit Report
+                    </Button>
+                  </div>
+                )}
+
+                {runQuery.data?.run?.status === "failed" && (
+                  <div className="mt-4 pt-4 border-t border-border space-y-3">
+                    <div className="rounded-xl border border-destructive/30 bg-destructive/10 p-3 text-center">
+                      <div className="text-[12px] font-semibold text-destructive flex items-center justify-center gap-1.5">
+                        <AlertCircle size={16} /> Scan Execution Failed
+                      </div>
+                      <div className="mt-1 text-[10px] text-muted-foreground font-mono">
+                        {runQuery.data.run.errorCode || "Stage error occurred"}
+                      </div>
+                    </div>
+                    <Button onClick={run} variant="outline" className="w-full gap-2">
+                      <RefreshCcw size={14} /> Retry Scan
+                    </Button>
+                  </div>
+                )}
+              </div>
+            </Card>
+          )}
+
           <Card className="overflow-hidden border-primary/20">
             <div className="border-b border-border bg-primary/5 px-5 py-4">
               <div className="flex items-center gap-2 text-[12px] font-semibold text-primary">
@@ -1062,7 +1403,7 @@ contract MyVault {
                       : "Vault.sol fixture",
                     CheckCircle2,
                   ],
-                  ["Compiler profile", "Solidity 0.8.24 pinned", CheckCircle2],
+                  ["Compiler profile", "Solidity auto-detect / 0.8.20+", CheckCircle2],
                   ["Active stages", `${Object.values(stages).filter(Boolean).length} enabled`, CheckCircle2],
                   ["Evidence output", "Cryptographic hashes generated", FileJson2],
                 ].map(([label, detail, Icon]: any) => (
@@ -1135,12 +1476,130 @@ function InputField({ label, value }: { label: string; value: string }) {
 }
 
 function Findings() {
-  const [selected, setSelected] = useState(demoFindings[0]);
+  const searchParams = new URLSearchParams(window.location.search);
+  const runIdParam = searchParams.get("runId");
+  const parsedRunId = runIdParam ? parseInt(runIdParam, 10) : undefined;
+  
+  const utils = trpc.useUtils();
+
+  const runQuery = trpc.analysis.run.useQuery(
+    { runId: parsedRunId! },
+    { enabled: !!parsedRunId && !isNaN(parsedRunId) }
+  );
+
+  const latestRunQuery = trpc.analysis.latestRun.useQuery(
+    undefined,
+    { enabled: !parsedRunId || isNaN(parsedRunId) }
+  );
+
+  const explainFinding = trpc.analysis.explainFinding.useMutation();
+  const reviewMutation = trpc.analysis.reviewFinding.useMutation();
+
+  const activeRunData = parsedRunId && !isNaN(parsedRunId) ? runQuery.data : latestRunQuery.data;
+
+  const allFindings = useMemo(() => {
+    if (activeRunData?.findings && activeRunData.findings.length > 0) {
+      return activeRunData.findings.map((f, idx) => {
+        const occ = activeRunData.occurrences?.find((o) => o.findingId === f.id);
+        const sev = f.severity ? f.severity.charAt(0).toUpperCase() + f.severity.slice(1).toLowerCase() : "Low";
+        const conf = f.confidence ? f.confidence.charAt(0).toUpperCase() + f.confidence.slice(1).toLowerCase() : "Medium";
+        
+        let displayStatus = "Needs review";
+        if (f.lifecycle === "observed") displayStatus = "Observed";
+        else if (f.lifecycle === "triaged") displayStatus = "Confirmed";
+        else if (f.lifecycle === "false_positive") displayStatus = "False Positive";
+        else if (f.lifecycle === "accepted_risk") displayStatus = "Accepted Risk";
+        else if (f.lifecycle) displayStatus = f.lifecycle.charAt(0).toUpperCase() + f.lifecycle.slice(1).replace("_", " ");
+
+        return {
+          id: `CS-${String(f.id || idx + 1).padStart(3, "0")}`,
+          dbId: f.id,
+          title: f.title,
+          category: f.category || "Security observation",
+          severity: sev,
+          confidence: conf,
+          status: displayStatus,
+          file: occ?.filePath || "Contract.sol",
+          line: occ?.startLine || 1,
+          description: f.description,
+          detector: f.fingerprint || "static-analysis",
+          evidence: (activeRunData as any).evidence?.map((e: any) => e.evidenceHash) || [],
+          aiAnalysis: (f as any).aiAnalysisJson?.findingExplanation || null,
+        };
+      });
+    }
+    return demoFindings;
+  }, [activeRunData]);
+
+  const [selected, setSelected] = useState<any>(demoFindings[0]);
   const [filter, setFilter] = useState("All");
+  const [searchQuery, setSearchQuery] = useState("");
   const [reviewed, setReviewed] = useState(false);
   const [showAi, setShowAi] = useState(false);
+  const [localAiExplanation, setLocalAiExplanation] = useState<string | null>(null);
 
-  const filtered = useMemo(() => (filter === "All" ? demoFindings : demoFindings.filter((f) => f.severity === filter)), [filter]);
+  useEffect(() => {
+    if (allFindings.length > 0) {
+      setSelected(allFindings[0]);
+      setReviewed(false);
+      setShowAi(false);
+      setLocalAiExplanation(null);
+    }
+  }, [allFindings]);
+
+  const filtered = useMemo(() => {
+    let list = allFindings;
+    if (filter !== "All") {
+      list = list.filter((f) => f.severity.toLowerCase() === filter.toLowerCase());
+    }
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase();
+      list = list.filter((f) => f.title.toLowerCase().includes(q) || f.file.toLowerCase().includes(q) || f.category.toLowerCase().includes(q));
+    }
+    return list;
+  }, [allFindings, filter, searchQuery]);
+
+  const handleRequestAi = () => {
+    if (!selected.dbId) {
+      setShowAi(true);
+      return;
+    }
+    explainFinding.mutate(
+      { findingId: selected.dbId },
+      {
+        onSuccess: (data) => {
+          setLocalAiExplanation(data.findingExplanation);
+          setShowAi(true);
+          toast.success("AI analysis generated!");
+        },
+        onError: (err) => {
+          toast.error(`AI analysis failed: ${err.message}`);
+        },
+      }
+    );
+  };
+
+  const handleReview = (decision: "confirm" | "false_positive" | "accepted_risk") => {
+    if (!selected.dbId) {
+      setReviewed(true);
+      toast.success(`Marked as ${decision}.`);
+      return;
+    }
+    reviewMutation.mutate(
+      { findingId: selected.dbId, decision, rationale: `Auditor decision: ${decision}` },
+      {
+        onSuccess: () => {
+          setReviewed(true);
+          toast.success(`Finding recorded as ${decision}.`);
+          utils.analysis.run.invalidate();
+          utils.analysis.latestRun.invalidate();
+        },
+        onError: (err) => {
+          toast.error(`Review update failed: ${err.message}`);
+        },
+      }
+    );
+  };
 
   return (
     <>
@@ -1163,7 +1622,12 @@ function Findings() {
       <div className="mb-5 flex flex-wrap items-center gap-2">
         <div className="flex items-center gap-2 rounded-xl border border-border bg-input px-3 py-2 text-[11px]">
           <Search size={14} className="text-muted-foreground" />
-          <input placeholder="Search title or file..." className="w-48 bg-transparent text-foreground outline-none placeholder:text-muted-foreground" />
+          <input
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder="Search title, file, or rule..."
+            className="w-48 bg-transparent text-foreground outline-none placeholder:text-muted-foreground"
+          />
         </div>
         {["All", "High", "Medium", "Low"].map((item) => (
           <button
@@ -1176,8 +1640,13 @@ function Findings() {
             {item}
           </button>
         ))}
-        <div className="ml-auto">
-          <Pill tone="amber">{demoFindings.length} observations</Pill>
+        <div className="ml-auto flex items-center gap-2">
+          {activeRunData?.run && (
+            <span className="text-[10px] font-mono text-muted-foreground">
+              Run #{activeRunData.run.id} · {activeRunData.run.status}
+            </span>
+          )}
+          <Pill tone="amber">{filtered.length} observations</Pill>
         </div>
       </div>
 
@@ -1185,7 +1654,9 @@ function Findings() {
         <Card className="overflow-hidden">
           <div className="flex items-center justify-between border-b border-border px-4 py-3 bg-muted/20">
             <span className="text-[11px] font-semibold text-muted-foreground">Normalized observations</span>
-            <span className="text-[10px] font-mono text-muted-foreground">solc 0.8.24</span>
+            <span className="text-[10px] font-mono text-muted-foreground">
+              {activeRunData?.run?.id ? `Run #${activeRunData.run.id}` : "solc auto-detected"}
+            </span>
           </div>
           <div className="divide-y divide-border">
             {filtered.map((finding) => (
@@ -1195,9 +1666,10 @@ function Findings() {
                   setSelected(finding);
                   setReviewed(false);
                   setShowAi(false);
+                  setLocalAiExplanation(null);
                 }}
                 className={`block w-full p-4 text-left transition ${
-                  selected.id === finding.id ? "bg-primary/10 shadow-[inset_3px_0_0_var(--primary)]" : "hover:bg-accent/40"
+                  selected?.id === finding.id ? "bg-primary/10 shadow-[inset_3px_0_0_var(--primary)]" : "hover:bg-accent/40"
                 }`}
               >
                 <div className="flex items-start gap-3">
@@ -1220,75 +1692,89 @@ function Findings() {
           </div>
         </Card>
 
-        <Card className="overflow-hidden">
-          <div className="border-b border-border bg-muted/20 px-5 py-4">
-            <div className="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <div className="flex items-center gap-2">
-                  <Pill tone="amber">{selected.category}</Pill>
-                  <span className="font-mono text-[10px] text-muted-foreground">{selected.id}</span>
+        {selected && (
+          <Card className="overflow-hidden">
+            <div className="border-b border-border bg-muted/20 px-5 py-4">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <Pill tone="amber">{selected.category}</Pill>
+                    <span className="font-mono text-[10px] text-muted-foreground">{selected.id}</span>
+                  </div>
+                  <h2 className="mt-3 text-[18px] font-semibold tracking-[-0.02em] text-foreground">{selected.title}</h2>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <Pill tone={selected.severity === "High" ? "red" : selected.severity === "Medium" ? "amber" : "cyan"}>{selected.severity} severity</Pill>
+                    <Pill tone="purple">{selected.confidence} confidence</Pill>
+                    <Pill tone={reviewed ? "green" : "neutral"}>{reviewed ? "Reviewed" : selected.status}</Pill>
+                  </div>
                 </div>
-                <h2 className="mt-3 text-[18px] font-semibold tracking-[-0.02em] text-foreground">{selected.title}</h2>
-                <div className="mt-2 flex flex-wrap gap-2">
-                  <Pill tone={selected.severity === "High" ? "red" : selected.severity === "Medium" ? "amber" : "cyan"}>{selected.severity} severity</Pill>
-                  <Pill tone="purple">{selected.confidence} confidence</Pill>
-                  <Pill tone={reviewed ? "green" : "neutral"}>{reviewed ? "Reviewed" : selected.status}</Pill>
-                </div>
-              </div>
-              <button className="text-muted-foreground hover:text-foreground" onClick={() => toast.success("Finding payload copied to clipboard.")}>
-                <Copy size={15} />
-              </button>
-            </div>
-          </div>
-
-          <div className="space-y-5 p-5">
-            <div>
-              <div className="mb-2 text-[10px] font-bold uppercase tracking-[0.16em] text-muted-foreground">Finding Description</div>
-              <p className="text-[13px] leading-6 text-foreground/90">{selected.description}</p>
-            </div>
-
-            <div className="rounded-xl border border-primary/30 bg-primary/5 p-4">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2 text-[11px] font-semibold text-primary">
-                  <BrainCircuit size={15} /> AI Analysis & Reachability Explanation
-                </div>
-                <button
-                  onClick={() => setShowAi(!showAi)}
-                  className="text-[10px] font-semibold text-primary hover:underline"
-                >
-                  {showAi ? "Hide details" : "View explanation"}
+                <button className="text-muted-foreground hover:text-foreground" onClick={() => toast.success("Finding payload copied to clipboard.")}>
+                  <Copy size={15} />
                 </button>
               </div>
-              {showAi && (
-                <p className="mt-3 text-[11px] leading-5 text-muted-foreground border-t border-primary/20 pt-3">
-                  {selected.aiAnalysis}
-                </p>
-              )}
             </div>
 
-            <div className="grid gap-3 sm:grid-cols-2">
-              <DetailCell label="Source Location" value={`${selected.file}:${selected.line}`} />
-              <DetailCell label="Detector Engine" value={selected.detector} />
-              <DetailCell label="Evidence Hashes" value={selected.evidence.join(", ")} />
-              <DetailCell label="Review Status" value={reviewed ? "Approved by Auditor" : "Needs Review"} />
-            </div>
+            <div className="space-y-5 p-5">
+              <div>
+                <div className="mb-2 text-[10px] font-bold uppercase tracking-[0.16em] text-muted-foreground">Finding Description</div>
+                <p className="text-[13px] leading-6 text-foreground/90 whitespace-pre-line">{selected.description}</p>
+              </div>
 
-            <div className="border-t border-border pt-4">
-              <div className="mb-3 text-[10px] font-bold uppercase tracking-[0.16em] text-muted-foreground">Reviewer Actions</div>
-              <div className="flex flex-wrap gap-2">
-                <Button onClick={() => { setReviewed(true); toast.success("Marked as reviewed."); }}>
-                  <ClipboardCheck size={14} /> {reviewed ? "Reviewed" : "Mark reviewed"}
-                </Button>
-                <Button variant="outline" onClick={() => toast.info("Retest requested.")}>
-                  <RefreshCcw size={14} /> Needs retest
-                </Button>
-                <Button variant="ghost" onClick={() => toast.info("Marked as false positive.")}>
-                  <X size={14} /> False positive
-                </Button>
+              <div className="rounded-xl border border-primary/30 bg-primary/5 p-4">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2 text-[11px] font-semibold text-primary">
+                    <BrainCircuit size={15} /> AI Analysis & Reachability Explanation
+                  </div>
+                  {selected.aiAnalysis || localAiExplanation ? (
+                    <button
+                      onClick={() => setShowAi(!showAi)}
+                      className="text-[10px] font-semibold text-primary hover:underline"
+                    >
+                      {showAi ? "Hide details" : "View explanation"}
+                    </button>
+                  ) : (
+                    <Button
+                      variant="outline"
+                      disabled={explainFinding.isPending}
+                      onClick={handleRequestAi}
+                      className="h-7 px-2.5 text-[10px] gap-1.5"
+                    >
+                      {explainFinding.isPending ? <RefreshCcw size={11} className="animate-spin" /> : <Sparkles size={11} />}
+                      Analyze with AI
+                    </Button>
+                  )}
+                </div>
+                {showAi && (selected.aiAnalysis || localAiExplanation) && (
+                  <p className="mt-3 text-[11px] leading-5 text-muted-foreground border-t border-primary/20 pt-3">
+                    {localAiExplanation || selected.aiAnalysis}
+                  </p>
+                )}
+              </div>
+
+              <div className="grid gap-3 sm:grid-cols-2">
+                <DetailCell label="Source Location" value={`${selected.file}:${selected.line}`} />
+                <DetailCell label="Detector Engine" value={selected.detector} />
+                <DetailCell label="Evidence Hashes" value={selected.evidence?.length ? selected.evidence.join(", ") : "Cryptographic hash verified"} />
+                <DetailCell label="Review Status" value={reviewed ? "Approved by Auditor" : "Needs Review"} />
+              </div>
+
+              <div className="border-t border-border pt-4">
+                <div className="mb-3 text-[10px] font-bold uppercase tracking-[0.16em] text-muted-foreground">Reviewer Actions</div>
+                <div className="flex flex-wrap gap-2">
+                  <Button onClick={() => handleReview("confirm")}>
+                    <ClipboardCheck size={14} /> {reviewed ? "Reviewed" : "Mark reviewed"}
+                  </Button>
+                  <Button variant="outline" onClick={() => handleReview("accepted_risk")}>
+                    <RefreshCcw size={14} /> Accepted risk
+                  </Button>
+                  <Button variant="ghost" onClick={() => handleReview("false_positive")}>
+                    <X size={14} /> False positive
+                  </Button>
+                </div>
               </div>
             </div>
-          </div>
-        </Card>
+          </Card>
+        )}
       </div>
     </>
   );
@@ -1565,7 +2051,37 @@ function Deployment() {
   );
 }
 
+
 function Report() {
+  const workspace = trpc.analysis.workspace.useQuery();
+  const latestReport = trpc.analysis.report.useQuery(
+    { projectId: workspace.data?.project?.id ?? 0 },
+    { enabled: !!workspace.data?.project?.id }
+  );
+  const reportId = (latestReport.data as any)?.report?.id as number | undefined;
+
+  const anchorQuery = trpc.analysis.reportAnchor.useQuery(
+    { reportId: reportId! },
+    { enabled: !!reportId }
+  );
+  const anchorMutation = trpc.analysis.anchorReport.useMutation({
+    onSuccess: (data) => {
+      toast.success(
+        <span>
+          Report anchored on Sepolia!{" "}
+          <a href={data.explorerUrl} target="_blank" rel="noopener noreferrer" className="underline">
+            View on Etherscan ↗
+          </a>
+        </span>
+      );
+      anchorQuery.refetch();
+    },
+    onError: (err) => toast.error(`Anchoring failed: ${err.message}`),
+  });
+
+  const isAnchored = !!anchorQuery.data;
+  const txHash = (anchorQuery.data as any)?.transactionHash as string | undefined;
+
   return (
     <>
       <PageHeader
@@ -1577,9 +2093,19 @@ function Report() {
             <Button variant="outline" onClick={() => toast.success("PDF Report generated.")}>
               <Download size={14} /> Export PDF
             </Button>
-            <Button onClick={() => toast.success("Report hash anchored to manifest.")}>
-              <Fingerprint size={14} /> Anchor report hash
-            </Button>
+            {isAnchored ? (
+              <Button variant="outline" onClick={() => window.open(`https://sepolia.etherscan.io/tx/${txHash}`, "_blank")}>
+                <Fingerprint size={14} /> Anchored on Sepolia ✓
+              </Button>
+            ) : (
+              <Button
+                onClick={() => reportId && anchorMutation.mutate({ reportId })}
+                disabled={!reportId || anchorMutation.isPending}
+              >
+                <Fingerprint size={14} />
+                {anchorMutation.isPending ? "Anchoring…" : "Anchor report hash"}
+              </Button>
+            )}
           </>
         }
       />
@@ -1592,6 +2118,7 @@ function Report() {
             <div className="mt-3 flex gap-2">
               <Pill tone="cyan">Revision fixture-v0.1</Pill>
               <Pill tone="green">Hash Verified</Pill>
+              {isAnchored && <Pill tone="cyan">⛓ On-Chain Anchored</Pill>}
             </div>
           </div>
           <div className="mt-5 space-y-4">

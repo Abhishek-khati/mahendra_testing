@@ -10,6 +10,11 @@ import { createContext } from "./context";
 import { serveStatic, setupVite } from "./vite";
 import { apiRateLimit, redactError, requestIdMiddleware, securityHeaders } from "../security";
 import { queueHealth } from "../analysis/queue";
+import { purgeOldRuns } from "./retention";
+import { register } from "./metrics";
+import { initSentry, captureException } from "./sentry";
+
+initSentry();
 
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise(resolve => {
@@ -44,6 +49,14 @@ async function startServer() {
     const ready = Boolean(process.env.DATABASE_URL && process.env.JWT_SECRET);
     res.status(ready ? 200 : 503).json({ status: ready ? "ready" : "not_ready", databaseConfigured: Boolean(process.env.DATABASE_URL), authConfigured: Boolean(process.env.JWT_SECRET), queue: queueHealth() });
   });
+  app.get("/metrics", async (_req, res) => {
+    try {
+      res.setHeader("Content-Type", register.contentType);
+      res.send(await register.metrics());
+    } catch (err) {
+      res.status(500).send(err instanceof Error ? err.message : "Metrics generation error");
+    }
+  });
   registerStorageProxy(app);
   registerOAuthRoutes(app);
   // tRPC API
@@ -58,6 +71,7 @@ async function startServer() {
   app.use((error: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
     const requestId = (req as express.Request & { requestId?: string }).requestId;
     console.error(JSON.stringify({ event: "http_error", requestId, ...redactError(error) }));
+    captureException(error, { requestId, path: req.path });
     if (res.headersSent) return;
     res.status(500).json({ error: { code: "INTERNAL_SERVER_ERROR", message: "Unexpected server error.", requestId } });
   });
@@ -75,8 +89,17 @@ async function startServer() {
     console.log(`Port ${preferredPort} is busy, using port ${port} instead`);
   }
 
-  server.listen(port, () => {
-    console.log(`Server running on http://localhost:${port}/`);
+  server.listen(port, "0.0.0.0", () => {
+    console.log(`Server running on http://0.0.0.0:${port}/`);
+
+    // Schedule data retention job: run once after 1 minute, then every 24 hours
+    const RETENTION_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+    setTimeout(() => {
+      purgeOldRuns().catch((err) => console.error("[Retention] Initial purge failed:", err));
+      setInterval(() => {
+        purgeOldRuns().catch((err) => console.error("[Retention] Scheduled purge failed:", err));
+      }, RETENTION_INTERVAL_MS);
+    }, 60_000); // 1 minute delay after startup
   });
 }
 

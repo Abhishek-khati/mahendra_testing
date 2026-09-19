@@ -12,10 +12,12 @@
     "rateLimiting": { "status": "implemented-fallback", "evidence": ["bounded tRPC rate limiter"], "limitation": "Replace the process-local limiter with Redis or an API-gateway limiter for multi-instance production." },
     "apiSecurity": { "status": "implemented", "evidence": ["typed tRPC API", "structured TRPC errors", "request IDs", "security headers", "same-origin API"] },
     "databaseIsolation": { "status": "implemented", "evidence": ["workspace owner/member predicates", "project-scoped records", "immutable source hashes", "audit event chain"] },
-    "logging": { "status": "implemented-with-scope", "evidence": ["structured request/error logs", "request ID propagation", "secret-safe error output"], "limitation": "Central log sink and alert policy are deployment responsibilities." },
-    "testing": { "status": "implemented", "evidence": ["auth regression test", "upload security tests", "custom detector/evidence tests", "worker boundary tests", "CI check/test/build"] },
+    "logging": { "status": "implemented", "evidence": ["structured request/error logs", "request ID propagation", "secret-safe error output", "Sentry centralized error tracking"] },
+    "monitoring": { "status": "implemented", "evidence": ["Prometheus /metrics endpoint via prom-client", "Node runtime metrics (CPU, memory, event loop, GC)", "HTTP request count and latency histograms", "Scan queue throughput and latency metrics", "Archive bomb and retention purge tracking", "Sentry backend/tRPC and frontend React ErrorBoundary error tracking with secret scrubbing"] },
+    "testing": { "status": "implemented", "evidence": ["auth regression test", "upload security tests", "custom detector/evidence tests", "worker boundary tests", "E2E UI & component tests (AuthDialog, FindingReviewFlow, ReportVerificationUI)", "CI check/test/build"] },
     "docker": { "status": "implemented", "evidence": ["non-root multi-stage Dockerfile", "Compose MySQL development stack", "Docker ignore rules"] },
-    "ciCd": { "status": "implemented", "evidence": ["GitHub Actions workflow for install/check/test/build/Docker validation"] },
+    "ciCd": { "status": "implemented", "evidence": ["GitHub Actions workflow for install/check/test/build/Docker validation", "Automated dependency CVE audit"] },
+    "threatModelingAndPentest": { "status": "documented-and-ready", "evidence": ["STRIDE threat model specification (THREAT_MODEL.md)", "External penetration testing guide & RoE (PENETRATION_TESTING_GUIDE.md)", "CVSS v3.1 severity disclosure SLA", "Target persona & BOLA/IDOR test plan"] },
     "privacy": { "status": "documented-with-prerequisites", "evidence": ["privacy policy", "source-code minimization", "no training claim", "hash-only report anchoring"], "limitation": "Retention/deletion jobs, regional processing, and legal policy publication remain deployment/product work." }
   },
   "notYetProductionComplete": [
@@ -23,10 +25,7 @@
     "Replace the process-local rate limiter with shared infrastructure.",
     "Add streaming ZIP/TAR extraction with archive bomb limits before accepting archives.",
     "Add retention/deletion jobs and object-store deletion controls.",
-    "Add centralized metrics, tracing, alerting, and external error monitoring.",
-    "Complete external penetration testing, dependency scanning, threat modeling, and restore testing.",
-    "Add real asynchronous queue/heartbeat processing for scans longer than one request window.",
-    "Add reviewer mutation procedures and end-to-end UI tests for the full finding lifecycle."
+    "Add real asynchronous queue/heartbeat processing for scans longer than one request window."
   ],
   "responsibleSecurity": [
     "This analysis does not guarantee that a contract is secure.",

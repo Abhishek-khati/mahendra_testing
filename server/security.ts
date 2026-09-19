@@ -1,14 +1,39 @@
 import { randomUUID } from "node:crypto";
 import type { Request, Response, NextFunction } from "express";
+import { Redis } from "ioredis";
+import { ENV } from "./_core/env";
+import { httpRequestsTotal, httpRequestDurationSeconds } from "./_core/metrics";
 
-const buckets = new Map<string, { windowStartedAt: number; count: number }>();
-const WINDOW_MS = 60_000;
+let redis: Redis | null = null;
+try {
+  redis = new Redis(ENV.redisUrl, {
+    maxRetriesPerRequest: 1,
+    enableOfflineQueue: false,
+    lazyConnect: true,
+    retryStrategy: () => null,
+  });
+  redis.on("error", () => {
+    // Suppress connection errors when local Redis is not running
+  });
+} catch {
+  redis = null;
+}
+
+const memoryRateLimitMap = new Map<string, { count: number; expiresAt: number }>();
+const WINDOW_SECS = 60;
 const MAX_REQUESTS_PER_WINDOW = 120;
 
 function clientKey(req: Request): string {
   const forwarded = req.headers["x-forwarded-for"];
   const ip = typeof forwarded === "string" ? forwarded.split(",")[0]?.trim() : req.socket.remoteAddress ?? "unknown";
-  return `${req.path}:${ip}`;
+  return `rl:${req.path}:${ip}`;
+}
+
+function normalizeRoute(path: string): string {
+  if (path.startsWith("/api/trpc")) return "/api/trpc";
+  if (path.startsWith("/api/storage")) return "/api/storage";
+  if (path.startsWith("/api/oauth")) return "/api/oauth";
+  return path;
 }
 
 export function requestIdMiddleware(req: Request, res: Response, next: NextFunction) {
@@ -18,21 +43,46 @@ export function requestIdMiddleware(req: Request, res: Response, next: NextFunct
   const startedAt = Date.now();
   res.on("finish", () => {
     const durationMs = Date.now() - startedAt;
+    const durationSec = durationMs / 1000;
+    const route = normalizeRoute(req.path);
+    const statusCode = String(res.statusCode);
+
+    httpRequestsTotal.inc({ method: req.method, route, status_code: statusCode });
+    httpRequestDurationSeconds.observe({ method: req.method, route, status_code: statusCode }, durationSec);
+
     console.log(JSON.stringify({ event: "http_request", requestId, method: req.method, path: req.path, status: res.statusCode, durationMs }));
   });
   next();
 }
 
-export function apiRateLimit(req: Request, res: Response, next: NextFunction) {
+export async function apiRateLimit(req: Request, res: Response, next: NextFunction) {
   const key = clientKey(req);
+  try {
+    if (redis && redis.status === "ready") {
+      const currentCount = await redis.incr(key);
+      if (currentCount === 1) {
+        await redis.expire(key, WINDOW_SECS);
+      }
+      if (currentCount > MAX_REQUESTS_PER_WINDOW) {
+        res.status(429).json({ error: { code: "RATE_LIMITED", message: "Too many requests. Retry after the rate-limit window." } });
+        return;
+      }
+      return next();
+    }
+  } catch {
+    // Fall back to in-memory rate limiter
+  }
+
+  // In-memory rate limiting fallback
   const now = Date.now();
-  const bucket = buckets.get(key);
-  if (!bucket || now - bucket.windowStartedAt >= WINDOW_MS) {
-    buckets.set(key, { windowStartedAt: now, count: 1 });
+  const record = memoryRateLimitMap.get(key);
+  if (!record || record.expiresAt < now) {
+    memoryRateLimitMap.set(key, { count: 1, expiresAt: now + WINDOW_SECS * 1000 });
     return next();
   }
-  bucket.count += 1;
-  if (bucket.count > MAX_REQUESTS_PER_WINDOW) {
+
+  record.count += 1;
+  if (record.count > MAX_REQUESTS_PER_WINDOW) {
     res.status(429).json({ error: { code: "RATE_LIMITED", message: "Too many requests. Retry after the rate-limit window." } });
     return;
   }

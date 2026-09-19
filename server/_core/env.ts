@@ -7,4 +7,11 @@ export const ENV = {
   isProduction: process.env.NODE_ENV === "production",
   forgeApiUrl: process.env.BUILT_IN_FORGE_API_URL ?? "",
   forgeApiKey: process.env.BUILT_IN_FORGE_API_KEY ?? "",
+  dataApiUrl: process.env.DATA_API_URL ?? "",
+  dataApiKey: process.env.DATA_API_KEY ?? "",
+  redisUrl: process.env.REDIS_URL ?? "redis://localhost:6379",
+  anchorRpcUrl: process.env.ANCHOR_RPC_URL ?? "",
+  anchorPrivateKey: process.env.ANCHOR_PRIVATE_KEY ?? "",
+  anchorContractAddress: process.env.ANCHOR_CONTRACT_ADDRESS ?? "",
+  sentryDsn: process.env.SENTRY_DSN ?? "",
 };

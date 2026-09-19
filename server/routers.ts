@@ -11,16 +11,22 @@ import {
   createQueuedRun,
   getFindingDetail,
   getLatestReport,
+  getLatestRunForUser,
   getOrCreateWorkspaceProject,
   getProjectAccess,
+  getReportAnchor,
   getRunFindings,
   reviewFinding,
+  saveReportAnchor,
   saveFindingAiAnalysis,
 } from "./analysis/db";
 import { manifestForFiles } from "./analysis/evidence";
 import { persistSourceBundle } from "./analysis/source-bundle";
 import { verifyReportHash } from "./analysis/report-verify";
 import { assertNoPrivateMaterial, assertSafeSourcePath } from "./security";
+import { extractZipSafely } from "./analysis/archive";
+import { anchorReportOnChain } from "./analysis/anchor";
+import { fetchGitHubRepoFiles } from "./analysis/github";
 
 const DEFAULT_STAGES = ["source-ingest", "solidity-compile", "slither", "custom-deterministic", "behavioral-tests", "normalize-findings", "contextual-ai", "report"];
 
@@ -29,7 +35,7 @@ const sourceFileInput = z.object({
   content: z.string().max(750_000),
 });
 
-const sourceFilesInput = z.array(sourceFileInput).min(1).max(100).superRefine((files, ctx) => {
+const sourceFilesInput = z.array(sourceFileInput).max(100).superRefine((files, ctx) => {
   const totalBytes = files.reduce((sum, file) => sum + Buffer.byteLength(file.content, "utf8"), 0);
   if (totalBytes > 10 * 1024 * 1024) ctx.addIssue({ code: "custom", message: "Source bundle exceeds the 10 MiB limit." });
 });
@@ -51,13 +57,27 @@ export const appRouter = router({
       return { workspace: result.workspace, project: result.project };
     }),
 
+    fetchGitHubRepo: protectedProcedure
+      .input(z.object({
+        url: z.string().min(3).max(256),
+        branch: z.string().max(100).optional(),
+        subpath: z.string().max(256).optional(),
+      }))
+      .mutation(async ({ input }) => {
+        return fetchGitHubRepoFiles(input);
+      }),
+
     startScan: protectedProcedure
       .input(z.object({
         projectId: z.number().int().positive().optional(),
         sourceKind: z.enum(["fixture", "upload", "repository"]).default("upload"),
         revisionLabel: z.string().min(1).max(180),
         idempotencyKey: z.string().min(8).max(128),
-        files: sourceFilesInput,
+        files: sourceFilesInput.default([]),
+        archiveBase64: z.string().optional(),
+        githubUrl: z.string().optional(),
+        githubBranch: z.string().optional(),
+        githubSubpath: z.string().optional(),
         requestedStages: z.array(z.string()).default(DEFAULT_STAGES),
         compilerProfile: z.object({ version: z.string().max(64).optional(), settings: z.record(z.string(), z.unknown()).optional() }).optional(),
       }))
@@ -73,21 +93,49 @@ export const appRouter = router({
         const projectAccess = await getProjectAccess(ctx.user.id, project.id);
         if (!projectAccess) throw new TRPCError({ code: "FORBIDDEN", message: "Project access denied." });
 
-        const files = input.files.map(file => ({ path: file.path, content: file.content }));
+        let files = input.files.map(file => ({ path: file.path, content: file.content }));
+        let revisionLabel = input.revisionLabel;
+        let sourceKind = input.sourceKind;
+
+        if (input.githubUrl) {
+          try {
+            const fetched = await fetchGitHubRepoFiles({
+              url: input.githubUrl,
+              branch: input.githubBranch,
+              subpath: input.githubSubpath,
+            });
+            files = fetched.files;
+            revisionLabel = fetched.revisionLabel;
+            sourceKind = "repository";
+          } catch (error) {
+            if (error instanceof TRPCError) throw error;
+            throw new TRPCError({ code: "BAD_REQUEST", message: error instanceof Error ? error.message : "Failed to fetch GitHub repository." });
+          }
+        } else if (input.archiveBase64) {
+          try {
+            const buffer = Buffer.from(input.archiveBase64, "base64");
+            const extracted = await extractZipSafely(buffer);
+            files.push(...extracted);
+          } catch (error) {
+             throw new TRPCError({ code: "BAD_REQUEST", message: error instanceof Error ? error.message : "Failed to extract ZIP archive." });
+          }
+        }
+
         try {
+          if (files.length === 0) throw new Error("No files provided.");
           files.forEach(file => assertSafeSourcePath(file.path));
           assertNoPrivateMaterial(files);
         } catch (error) {
           throw new TRPCError({ code: "BAD_REQUEST", message: error instanceof Error && error.message.startsWith("SOURCE_SECRET_REJECTED") ? "Source upload rejected: private material or secrets must not be uploaded." : "Source path or upload content rejected." });
         }
-        const manifest = manifestForFiles(files, input.revisionLabel, input.sourceKind);
+        const manifest = manifestForFiles(files, revisionLabel, sourceKind);
         const artifactKey = await persistSourceBundle(ctx.user.id, project.id, files, manifest);
         const run = await createQueuedRun({
           projectId: project.id,
           requestedBy: ctx.user.id,
           idempotencyKey: input.idempotencyKey,
-          sourceKind: input.sourceKind,
-          revisionLabel: input.revisionLabel,
+          sourceKind,
+          revisionLabel,
           contentHash: manifest.contentHash,
           manifestJson: manifest,
           artifactKey,
@@ -116,6 +164,14 @@ export const appRouter = router({
     run: protectedProcedure
       .input(z.object({ runId: z.number().int().positive() }))
       .query(async ({ ctx, input }) => getRunFindings(ctx.user.id, input.runId)),
+
+    latestRun: protectedProcedure
+      .input(z.object({ projectId: z.number().int().positive().optional() }).optional())
+      .query(async ({ ctx, input }) => {
+        const latest = await getLatestRunForUser(ctx.user.id, input?.projectId);
+        if (!latest) return null;
+        return getRunFindings(ctx.user.id, latest.run.id);
+      }),
 
     explainFinding: protectedProcedure
       .input(z.object({ findingId: z.number().int().positive() }))
@@ -161,6 +217,40 @@ export const appRouter = router({
     verifyReport: protectedProcedure
       .input(z.object({ contentJson: z.unknown(), expectedHash: z.string().length(64) }))
       .mutation(({ input }) => ({ valid: verifyReportHash(input.contentJson, input.expectedHash), statement: "A valid hash proves report integrity, not contract security." })),
+
+    anchorReport: protectedProcedure
+      .input(z.object({ reportId: z.number().int().positive() }))
+      .mutation(async ({ ctx, input }) => {
+        // Look up the report directly by reportId
+        const { getDb } = await import("./db");
+        const db = await getDb();
+        if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable." });
+        const { reports } = await import("../drizzle/schema");
+        const { eq } = await import("drizzle-orm");
+        const reportRows = await db.select().from(reports).where(eq(reports.id, input.reportId)).limit(1);
+        const report = reportRows[0];
+        if (!report) throw new TRPCError({ code: "NOT_FOUND", message: "Report not found." });
+
+        // Verify user has owner/maintainer access to this report's project
+        const access = await getProjectAccess(ctx.user.id, report.projectId);
+        if (!access || !["owner", "maintainer"].includes(access.role)) {
+          throw new TRPCError({ code: "FORBIDDEN", message: "Only owners and maintainers can anchor reports." });
+        }
+
+        try {
+          const result = await anchorReportOnChain(report.contentHash);
+          await saveReportAnchor({ reportId: input.reportId, network: "sepolia", payloadHash: report.contentHash, txHash: result.txHash });
+          await appendAuditEvent({ workspaceId: access.workspace.id, actorId: ctx.user.id, action: "report.anchored", targetType: "report", targetId: String(input.reportId), metadataJson: { txHash: result.txHash, network: "sepolia" } });
+          return result;
+        } catch (error) {
+          if (error instanceof TRPCError) throw error;
+          throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error instanceof Error ? error.message : "Anchoring failed." });
+        }
+      }),
+
+    reportAnchor: protectedProcedure
+      .input(z.object({ reportId: z.number().int().positive() }))
+      .query(async ({ input }) => getReportAnchor(input.reportId)),
   }),
 });
 

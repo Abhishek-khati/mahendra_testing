@@ -9,6 +9,7 @@ import {
   findingRecords,
   findingReviews,
   projects,
+  reportAnchors,
   reports,
   runStages,
   sourceRevisions,
@@ -119,6 +120,47 @@ export async function markRunStarted(runId: number) {
   const db = await getDb();
   if (!db) throw new Error("DATABASE_UNAVAILABLE");
   await db.update(analysisRuns).set({ status: "running", startedAt: new Date() }).where(eq(analysisRuns.id, runId));
+}
+
+export async function updateRunStage(
+  runId: number,
+  stageType: string,
+  status: "queued" | "running" | "succeeded" | "failed" | "skipped" | "cancelled",
+  extra?: { workerVersion?: string; errorCode?: string }
+) {
+  const db = await getDb();
+  if (!db) return;
+  const updateData: Record<string, unknown> = { status };
+  if (status === "running") {
+    updateData.startedAt = new Date();
+  } else if (status === "succeeded" || status === "failed" || status === "skipped") {
+    updateData.completedAt = new Date();
+  }
+  if (extra?.workerVersion) updateData.workerVersion = extra.workerVersion;
+  if (extra?.errorCode) updateData.errorCode = extra.errorCode;
+  await db.update(runStages)
+    .set(updateData)
+    .where(and(eq(runStages.runId, runId), eq(runStages.stageType, stageType), eq(runStages.attempt, 1)));
+}
+
+export async function getLatestRunForUser(userId: number, projectId?: number) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const conditions = [
+    or(eq(workspaces.ownerId, userId), eq(workspaceMembers.userId, userId)),
+  ];
+  if (projectId) {
+    conditions.push(eq(analysisRuns.projectId, projectId));
+  }
+  const rows = await db.select({ run: analysisRuns, project: projects })
+    .from(analysisRuns)
+    .innerJoin(projects, eq(projects.id, analysisRuns.projectId))
+    .innerJoin(workspaces, eq(workspaces.id, projects.workspaceId))
+    .leftJoin(workspaceMembers, and(eq(workspaceMembers.workspaceId, workspaces.id), eq(workspaceMembers.userId, userId)))
+    .where(and(...conditions))
+    .orderBy(desc(analysisRuns.id))
+    .limit(1);
+  return rows[0];
 }
 
 
@@ -243,4 +285,23 @@ export async function reviewFinding(input: { userId: number; findingId: number; 
   await db.insert(findingReviews).values({ findingId: input.findingId, reviewerId: input.userId, decision: input.decision, rationale: input.rationale, reviewVersion: 1 });
   await db.update(findingRecords).set({ lifecycle, updatedAt: new Date() }).where(eq(findingRecords.id, input.findingId));
   return { findingId: input.findingId, lifecycle };
+}
+
+export async function saveReportAnchor(input: { reportId: number; network: string; payloadHash: string; txHash: string }) {
+  const db = await getDb();
+  if (!db) throw new Error("DATABASE_UNAVAILABLE");
+  await db.insert(reportAnchors).values({
+    reportId: input.reportId,
+    network: input.network,
+    payloadHash: input.payloadHash,
+    transactionHash: input.txHash,
+    status: "confirmed",
+  });
+}
+
+export async function getReportAnchor(reportId: number) {
+  const db = await getDb();
+  if (!db) return null;
+  const rows = await db.select().from(reportAnchors).where(eq(reportAnchors.reportId, reportId)).limit(1);
+  return rows[0] ?? null;
 }

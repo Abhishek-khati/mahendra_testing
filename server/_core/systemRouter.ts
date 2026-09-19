@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { notifyOwner } from "./notification";
 import { adminProcedure, publicProcedure, router } from "./trpc";
+import { purgeOldRuns } from "./retention";
 
 export const systemRouter = router({
   health: publicProcedure
@@ -25,5 +26,12 @@ export const systemRouter = router({
       return {
         success: delivered,
       } as const;
+    }),
+
+  runRetentionJob: adminProcedure
+    .input(z.object({ daysOld: z.number().min(1).default(30) }).default({ daysOld: 30 }))
+    .mutation(async ({ input }) => {
+      const purgedCount = await purgeOldRuns(input.daysOld);
+      return { success: true, purgedCount } as const;
     }),
 });

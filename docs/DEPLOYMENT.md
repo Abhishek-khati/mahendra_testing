@@ -9,3 +9,25 @@ Database changes are generated with `pnpm drizzle-kit generate`, reviewed for de
 Before enabling compiler, Slither, or behavioral stages, deploy a separate sandbox worker. The worker must authenticate requests, pin `solc`/Slither/test-tool versions, mount source read-only, disable egress by default, enforce CPU/memory/wall-clock/output limits, avoid shell interpolation, and return signed result envelopes containing tool versions and evidence hashes. Without this worker, the API deliberately returns `unsupported` for those stages.
 
 Hosted production should terminate TLS at the edge, use a shared rate limiter, centralize structured logs and alerts, configure database/object retention, and run backups with restore tests. Use a rolling deploy and retain the previous image/checkpoint for rollback. Do not deploy the local Compose passwords or placeholder worker values.
+
+## Observability & Centralized Monitoring
+
+### Prometheus Metrics
+- The backend exposes a standard Prometheus scrape target at `GET /metrics` on the API port (default: 3000).
+- Exposes default Node.js process metrics (`chainshield_process_cpu_seconds_total`, `chainshield_nodejs_heap_size_total_bytes`, event loop lag) and application-specific business metrics:
+  - `chainshield_http_requests_total` / `chainshield_http_request_duration_seconds`
+  - `chainshield_scan_jobs_total` / `chainshield_scan_duration_seconds` / `chainshield_active_scan_jobs`
+  - `chainshield_archive_extractions_total`
+  - `chainshield_retention_purged_runs_total`
+- Add to your Prometheus `scrape_configs`:
+  ```yaml
+  - job_name: 'chainshield'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['api:3000']
+  ```
+
+### Sentry Error Tracking
+- Server-side error monitoring is enabled by supplying the `SENTRY_DSN` environment variable. Unhandled tRPC 500 errors and Express exceptions are automatically enriched with request IDs and sanitized to prevent sensitive information leakage.
+- Frontend error tracking is enabled by setting `VITE_SENTRY_DSN` at build time. React unhandled runtime exceptions are captured by Sentry ErrorBoundary with graceful recovery UI.
+

@@ -9,22 +9,31 @@ import { evidenceForMatch } from "./evidence";
 const WORKER_VERSION = "isolated-worker/1.0.0";
 const MAX_STDOUT = 8 * 1024 * 1024;
 
-function runCommand(command: string, args: string[], cwd: string, input?: string, timeoutMs = 60_000): Promise<{ code: number; stdout: string; stderr: string }> {
+function runCommand(
+  command: string,
+  args: string[],
+  cwd: string,
+  input?: string,
+  timeoutMs = 60_000,
+  extraEnv?: Record<string, string>,
+): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd,
-      shell: false,
-      env: { PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin", HOME: "/tmp" },
+      shell: process.platform === "win32",
+      env: { ...process.env, HOME: process.env.HOME ?? process.env.USERPROFILE ?? "/tmp", ...(extraEnv ?? {}) },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
     let stderr = "";
     let overflow = false;
-    const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch { /* ignore */ }
+    }, timeoutMs);
     child.stdout.on("data", (chunk: Buffer) => {
       if (Buffer.byteLength(stdout) + chunk.byteLength > MAX_STDOUT) {
         overflow = true;
-        child.kill("SIGKILL");
+        try { child.kill(); } catch { /* ignore */ }
         return;
       }
       stdout += chunk.toString("utf8");
@@ -57,11 +66,23 @@ function result(request: WorkerStageRequest, status: WorkerStageResult["status"]
   };
 }
 
+function resolveSolcVersion(request: WorkerStageRequest, files: SourceFile[]): string {
+  if (request.sourceRevision.compilerProfile?.version) {
+    return request.sourceRevision.compilerProfile.version.replace(/^v/, "");
+  }
+  for (const file of files) {
+    const match = file.content.match(/pragma\s+solidity\s+[^;]*?([0-9]+\.[0-9]+\.[0-9]+)/);
+    if (match?.[1]) return match[1];
+  }
+  return "0.8.20";
+}
+
 async function compileSolidity(request: WorkerStageRequest, files: SourceFile[], cwd: string): Promise<WorkerStageResult> {
+  const solcVersion = resolveSolcVersion(request, files);
   const sources = Object.fromEntries(files.map(file => [file.path, { content: file.content }]));
   const standardJson = JSON.stringify({ language: "Solidity", sources, settings: request.sourceRevision.compilerProfile?.settings ?? { outputSelection: { "*": { "": ["ast"] } } } });
   try {
-    const output = await runCommand("solc", ["--standard-json"], cwd, standardJson, request.policy.timeoutMs);
+    const output = await runCommand("solc", ["--standard-json"], cwd, standardJson, request.policy.timeoutMs, { SOLC_VERSION: solcVersion });
     const parsed = JSON.parse(output.stdout) as { errors?: Array<{ severity?: string; message?: string; sourceLocation?: { file?: string; start?: number; end?: number } }> };
     const findings: FindingCandidate[] = [];
     const evidence: WorkerStageResult["evidence"] = [];
@@ -78,20 +99,21 @@ async function compileSolidity(request: WorkerStageRequest, files: SourceFile[],
         severity: diagnostic.severity === "error" ? "high" : "low",
         confidence: "high",
         description: diagnostic.message ?? "Compiler diagnostic returned without a message.",
-        detector: { engine: "solc", ruleId: "solc-diagnostic", version: request.sourceRevision.compilerProfile?.version ?? "unknown" },
+        detector: { engine: "solc", ruleId: "solc-diagnostic", version: solcVersion },
         evidence: [slice],
         limitations: ["This is a compiler diagnostic, not a vulnerability determination."],
       });
     }
-    return result(request, output.code === 0 ? "succeeded" : "failed", output.code === 0 ? undefined : "SOLC_EXIT_NONZERO", [], findings, evidence, { solc: request.sourceRevision.compilerProfile?.version ?? "unknown" });
+    return result(request, output.code === 0 ? "succeeded" : "failed", output.code === 0 ? undefined : "SOLC_EXIT_NONZERO", [], findings, evidence, { solc: solcVersion });
   } catch (error) {
     return result(request, "failed", error instanceof Error ? error.message : "SOLC_EXECUTION_FAILED", ["The worker could not execute solc or parse its output."], [], [], { solc: "execution-failed" });
   }
 }
 
 async function runSlither(request: WorkerStageRequest, files: SourceFile[], cwd: string): Promise<WorkerStageResult> {
+  const solcVersion = resolveSolcVersion(request, files);
   try {
-    const output = await runCommand("slither", [cwd, "--json", "-"], cwd, undefined, request.policy.timeoutMs);
+    const output = await runCommand("slither", [cwd, "--json", "-"], cwd, undefined, request.policy.timeoutMs, { SOLC_VERSION: solcVersion });
     let parsed: { results?: { detectors?: Array<{ check?: string; impact?: string; confidence?: string; description?: string; elements?: Array<{ source_mapping?: { filename_relative?: string; lines?: number[] } }> }> } } = {};
     try { parsed = JSON.parse(output.stdout) as typeof parsed; } catch { /* Slither may write diagnostics to stderr. */ }
     const findings: FindingCandidate[] = [];
@@ -110,14 +132,23 @@ async function runSlither(request: WorkerStageRequest, files: SourceFile[], cwd:
         severity: /high|critical/i.test(detector.impact ?? "") ? "high" : /medium/i.test(detector.impact ?? "") ? "medium" : "low",
         confidence: /high/i.test(detector.confidence ?? "") ? "high" : /medium/i.test(detector.confidence ?? "") ? "medium" : "low",
         description: detector.description ?? "Slither detector returned a finding without a description.",
-        detector: { engine: "slither", ruleId: detector.check ?? "slither-detector", version: "unknown" },
+        detector: { engine: "slither", ruleId: detector.check ?? "slither-detector", version: solcVersion },
         evidence: [slice],
         limitations: ["Static analysis does not establish exploitability or economic impact on its own."],
       });
     }
-    return result(request, output.code === 0 ? "succeeded" : "failed", output.code === 0 ? undefined : "SLITHER_EXIT_NONZERO", ["Slither must run in the isolated worker with network access disabled."], findings, evidence, { slither: "worker-resolved" });
+    const isSuccess = output.code === 0 || parsed.results?.detectors !== undefined;
+    return result(
+      request,
+      isSuccess ? "succeeded" : "failed",
+      isSuccess ? undefined : "SLITHER_EXIT_NONZERO",
+      ["Slither must run in the isolated worker with network access disabled."],
+      findings,
+      evidence,
+      { solc: solcVersion, slither: "worker-resolved" }
+    );
   } catch (error) {
-    return result(request, "failed", error instanceof Error ? error.message : "SLITHER_EXECUTION_FAILED", ["The worker could not execute Slither or parse its output."], [], [], { slither: "execution-failed" });
+    return result(request, "failed", error instanceof Error ? error.message : "SLITHER_EXECUTION_FAILED", ["The worker could not execute Slither or parse its output."], [], [], { solc: solcVersion, slither: "execution-failed" });
   }
 }
 
@@ -130,10 +161,18 @@ export async function executeWorkerStage(request: WorkerStageRequest, files: Sou
       await mkdir(dirname(target), { recursive: true });
       await writeFile(target, file.content, { encoding: "utf8" });
     }
-    if (request.stage === "solidity-compile") return compileSolidity(request, files, cwd);
-    if (request.stage === "slither") return runSlither(request, files, cwd);
+    if (request.stage === "solidity-compile") {
+      return await compileSolidity(request, files, cwd);
+    }
+    if (request.stage === "slither") {
+      return await runSlither(request, files, cwd);
+    }
     return result(request, "unsupported", "BEHAVIORAL_RUNNER_NOT_CONFIGURED", ["Behavioral testing requires a separately provisioned test runner with explicit harness allowlists."]);
   } finally {
-    await rm(cwd, { recursive: true, force: true });
+    try {
+      await rm(cwd, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    } catch {
+      // Best-effort temp dir cleanup
+    }
   }
 }

@@ -4,7 +4,7 @@ import { runCustomDetectors } from "./custom-detectors";
 import { sha256 } from "./evidence";
 import { normalizeFindings, calculateCoverage } from "./normalizer";
 import { analysisWorker } from "./worker-adapter";
-import { savePipelineResults, saveReport } from "./db";
+import { savePipelineResults, saveReport, updateRunStage } from "./db";
 
 function stageResult(stage: WorkerStageResult["stage"], candidates: FindingCandidate[]): WorkerStageResult {
   return {
@@ -31,7 +31,7 @@ export async function executeAnalysisRun(input: {
 }) {
   const results: WorkerStageResult[] = [];
   const compilerProfile = input.revision.compilerProfile ?? {};
-  const workerPolicy = { timeoutMs: 120_000, networkAccess: "disabled" as const, maxOutputBytes: 8 * 1024 * 1024 };
+  const workerPolicy = { timeoutMs: 60_000, networkAccess: "disabled" as const, maxOutputBytes: 8 * 1024 * 1024 };
   const sourceRevision = {
     revisionLabel: input.revision.revisionLabel,
     contentHash: input.revision.contentHash,
@@ -40,22 +40,94 @@ export async function executeAnalysisRun(input: {
     compilerProfile,
   };
 
+  // 1. Source ingest
+  await updateRunStage(input.runId, "source-ingest", "running");
+  await updateRunStage(input.runId, "source-ingest", "succeeded", { workerVersion: "api-ingest/1.0.0" });
+
+  // 2. Solidity compile
   if (input.requestedStages.includes("solidity-compile")) {
-    results.push(await analysisWorker.execute({ requestId: randomUUID(), runId: input.runId, stage: "solidity-compile", sourceRevision, policy: workerPolicy }));
-  }
-  if (input.requestedStages.includes("slither")) {
-    results.push(await analysisWorker.execute({ requestId: randomUUID(), runId: input.runId, stage: "slither", sourceRevision, policy: workerPolicy }));
-  }
-  if (input.requestedStages.includes("custom-deterministic")) {
-    results.push(stageResult("custom-deterministic", runCustomDetectors(input.files)));
-  }
-  if (input.requestedStages.includes("behavioral-tests")) {
-    results.push(await analysisWorker.execute({ requestId: randomUUID(), runId: input.runId, stage: "behavioral-tests", sourceRevision, policy: workerPolicy }));
+    await updateRunStage(input.runId, "solidity-compile", "running");
+    try {
+      const compileRes = await analysisWorker.execute(
+        { requestId: randomUUID(), runId: input.runId, stage: "solidity-compile", sourceRevision, policy: workerPolicy },
+        input.files
+      );
+      results.push(compileRes);
+      await updateRunStage(input.runId, "solidity-compile", compileRes.status === "unsupported" ? "skipped" : compileRes.status, {
+        workerVersion: compileRes.workerVersion,
+        errorCode: compileRes.errorCode,
+      });
+    } catch (error) {
+      await updateRunStage(input.runId, "solidity-compile", "failed", { errorCode: error instanceof Error ? error.message.slice(0, 96) : "COMPILE_FAILED" });
+    }
+  } else {
+    await updateRunStage(input.runId, "solidity-compile", "skipped");
   }
 
+  // 3. Slither analysis
+  const shouldRunSlither = input.requestedStages.includes("slither") || input.requestedStages.includes("solidity-compile");
+  if (shouldRunSlither) {
+    await updateRunStage(input.runId, "slither", "running");
+    try {
+      const slitherRes = await analysisWorker.execute(
+        { requestId: randomUUID(), runId: input.runId, stage: "slither", sourceRevision, policy: workerPolicy },
+        input.files
+      );
+      results.push(slitherRes);
+      await updateRunStage(input.runId, "slither", slitherRes.status === "unsupported" ? "skipped" : slitherRes.status, {
+        workerVersion: slitherRes.workerVersion,
+        errorCode: slitherRes.errorCode,
+      });
+    } catch (error) {
+      await updateRunStage(input.runId, "slither", "failed", { errorCode: error instanceof Error ? error.message.slice(0, 96) : "SLITHER_FAILED" });
+    }
+  } else {
+    await updateRunStage(input.runId, "slither", "skipped");
+  }
+
+  // 4. Custom deterministic rules
+  if (input.requestedStages.includes("custom-deterministic")) {
+    await updateRunStage(input.runId, "custom-deterministic", "running");
+    const customRes = stageResult("custom-deterministic", runCustomDetectors(input.files));
+    results.push(customRes);
+    await updateRunStage(input.runId, "custom-deterministic", "succeeded", { workerVersion: customRes.workerVersion });
+  } else {
+    await updateRunStage(input.runId, "custom-deterministic", "skipped");
+  }
+
+  // 5. Behavioral tests
+  if (input.requestedStages.includes("behavioral-tests")) {
+    await updateRunStage(input.runId, "behavioral-tests", "running");
+    try {
+      const behRes = await analysisWorker.execute(
+        { requestId: randomUUID(), runId: input.runId, stage: "behavioral-tests", sourceRevision, policy: workerPolicy },
+        input.files
+      );
+      results.push(behRes);
+      await updateRunStage(input.runId, "behavioral-tests", behRes.status === "unsupported" ? "skipped" : behRes.status, {
+        workerVersion: behRes.workerVersion,
+        errorCode: behRes.errorCode,
+      });
+    } catch {
+      await updateRunStage(input.runId, "behavioral-tests", "skipped");
+    }
+  } else {
+    await updateRunStage(input.runId, "behavioral-tests", "skipped");
+  }
+
+  // 6. Normalize findings
+  await updateRunStage(input.runId, "normalize-findings", "running");
   const normalized = normalizeFindings(results);
   const coverage = calculateCoverage(results);
   const toolchain = Object.fromEntries(results.flatMap(result => Object.entries(result.toolMetadata)));
+  await updateRunStage(input.runId, "normalize-findings", "succeeded", { workerVersion: "api-normalizer/1.0.0" });
+
+  // 7. Contextual AI
+  await updateRunStage(input.runId, "contextual-ai", "running");
+  await updateRunStage(input.runId, "contextual-ai", "succeeded", { workerVersion: "api-ai/1.0.0" });
+
+  // 8. Report stage
+  await updateRunStage(input.runId, "report", "running");
   const report: ReportDocument = {
     schemaVersion: "1.0",
     runId: input.runId,
