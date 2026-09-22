@@ -1021,7 +1021,7 @@ contract MyVault {
                 </div>
                 <div className="mt-4 text-[13px] font-semibold text-foreground">Choose Solidity source files</div>
                 <div className="mt-1 text-[11px] text-muted-foreground">Select contract files or use sample fixture</div>
-                <input ref={fileInputRef} type="file" multiple accept=".sol,.vy,.json,.toml,.txt" className="hidden" onChange={onFilesSelected} />
+                <input ref={fileInputRef} type="file" multiple accept=".sol,.vy,.json,.toml,.txt,.zip" className="sr-only" onChange={onFilesSelected} />
                 <Button variant="outline" className="mt-5" onClick={() => fileInputRef.current?.click()}>
                   Browse files
                 </Button>
