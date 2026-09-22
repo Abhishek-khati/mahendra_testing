@@ -12,6 +12,7 @@ WORKDIR /app
 ENV NODE_ENV=production
 RUN corepack enable && useradd --create-home --shell /usr/sbin/nologin chainshield
 COPY --from=build /app/package.json /app/pnpm-lock.yaml ./
+COPY --from=build /app/patches ./patches
 RUN pnpm install --prod --frozen-lockfile
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/drizzle ./drizzle
