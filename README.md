@@ -9,7 +9,7 @@ security risks before deploying Solidity smart contracts.
 
 The project was developed as part of an **AI + Web3 hackathon** by a
 team of four.
-
+...
 ------------------------------------------------------------------------
 
 ## 🚀 About the Project
