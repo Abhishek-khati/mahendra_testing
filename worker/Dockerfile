@@ -6,6 +6,7 @@ RUN corepack enable
 
 # Install dependencies (only what's needed to build)
 COPY package.json pnpm-lock.yaml ./
+COPY patches ./patches
 RUN pnpm install --frozen-lockfile
 
 # Copy source and compile the worker server
