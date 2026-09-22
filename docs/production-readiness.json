@@ -6,7 +6,7 @@
     "authentication": { "status": "implemented", "evidence": ["OAuth session flow", "protected tRPC procedures", "secure session cookie plumbing"] },
     "authorization": { "status": "implemented-with-scope", "evidence": ["workspace owner/member isolation", "owner/maintainer scan mutation gate", "viewer/reviewer read access"] },
     "inputValidation": { "status": "implemented", "evidence": ["zod API schemas", "10 MiB bundle limit", "750 KiB per-file limit", "safe relative paths"] },
-    "uploadSecurity": { "status": "implemented-with-scope", "evidence": ["secret-marker rejection", "object storage references instead of DB blobs", "bounded request body"], "limitation": "Full archive extraction bomb scanning is not enabled because the current API accepts normalized file arrays; ZIP/TAR ingestion must add streaming extraction limits before production." },
+    "uploadSecurity": { "status": "implemented", "evidence": ["secret-marker rejection", "object storage references instead of DB blobs", "bounded request body", "streaming ZIP extraction with bomb limits"] },
     "sandboxing": { "status": "boundary-implemented-worker-required", "evidence": ["external worker adapter", "worker endpoint/token", "unsupported result when absent", "standalone solc/Slither worker entry contract"], "limitation": "A separately deployed hardened worker is still required for live tool execution." },
     "secrets": { "status": "implemented", "evidence": ["server-only Forge key use", "no private-key persistence", "redacted errors", "no secret template committed"] },
     "rateLimiting": { "status": "implemented-fallback", "evidence": ["bounded tRPC rate limiter"], "limitation": "Replace the process-local limiter with Redis or an API-gateway limiter for multi-instance production." },
@@ -23,7 +23,7 @@
   "notYetProductionComplete": [
     "Deploy and independently harden the compiler/Slither/behavioral worker.",
     "Replace the process-local rate limiter with shared infrastructure.",
-    "Add streaming ZIP/TAR extraction with archive bomb limits before accepting archives.",
+
     "Add retention/deletion jobs and object-store deletion controls.",
     "Add real asynchronous queue/heartbeat processing for scans longer than one request window."
   ],
